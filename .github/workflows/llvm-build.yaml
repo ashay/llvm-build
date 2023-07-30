@@ -1,0 +1,237 @@
+name: LLVM Build
+
+
+on:
+
+  push:
+
+    branches:
+      - main
+
+    paths:
+      - llvm-hash.txt
+
+  workflow_dispatch:
+
+
+env:
+  SCCACHE_DIR: ${{ github.workspace }}/sccache
+
+
+jobs:
+
+  build:
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        platform: [
+          ubuntu-22.04-x64,
+          macos-12-arm64,
+          windows-2022-x64
+        ]
+
+        include:
+          # Specify OS versions
+          - platform: ubuntu-22.04-x64
+            host-os: ubuntu-22.04
+            target-os: ubuntu
+            arch: x64
+          - platform: macos-12-arm64
+            host-os: macos-12
+            target-os: macos
+            arch: arm64
+          - platform: windows-2022-x64
+            host-os: windows-2022
+            target-os: windows
+            arch: x64
+
+    runs-on: ${{ matrix.host-os }}
+
+    steps:
+
+    - name: Checkout Repo
+      uses: actions/checkout@v3
+      with:
+        path: llvm-build
+
+    - name: Fetch LLVM Commit Hash
+      shell: bash
+      run: |
+        LLVM_COMMIT_HASH="$(cat llvm-build/llvm-hash.txt)"
+        echo "Found LLVM commit hash: ${LLVM_COMMIT_HASH}"
+        echo "llvm_commit_hash=${LLVM_COMMIT_HASH}" >> ${GITHUB_ENV}
+
+        SHORT_LLVM_COMMIT_HASH="${LLVM_COMMIT_HASH:0:8}"
+        echo "Short LLVM commit hash: ${SHORT_LLVM_COMMIT_HASH}"
+        echo "short_llvm_commit_hash=${SHORT_LLVM_COMMIT_HASH}" >> ${GITHUB_ENV}
+
+        INSTALL_DIR="llvm-${SHORT_LLVM_COMMIT_HASH}-${{ matrix.platform }}"
+        echo "LLVM installation directory name: ${INSTALL_DIR}"
+        echo "llvm_install_dir=${INSTALL_DIR}" >> ${GITHUB_ENV}
+
+    - name: Checkout LLVM
+      uses: actions/checkout@v3
+      with:
+        repository: llvm/llvm-project
+        path: llvm-project
+        ref: ${{ env.llvm_commit_hash }}
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: 3.11
+
+    - name: Install Prerequisites
+      shell: bash
+      run: |
+        python3 -m pip install cmake ninja sccache
+        mkdir -p ${{ env.SCCACHE_DIR }}
+        rm -rf ${{ env.SCCACHE_DIR }}/*
+
+    - name: Enable Cache
+      uses: actions/cache@v3
+      with:
+        path: ${{ env.SCCACHE_DIR }}
+        key: ${{ matrix.platform }}-${{ env.short_llvm_commit_hash }}
+        restore-keys: ${{ matrix.platform }}-
+
+    - name: Setup Visual Studio Shell (Windows)
+      if: matrix.target-os == 'windows'
+      uses: TheMrMilchmann/setup-msvc-dev@v2
+      with:
+        arch: x64
+
+    - name: Configure, Build, Test, and Install LLVM (Ubuntu)
+      if: matrix.target-os == 'ubuntu'
+      shell: bash
+      run: >
+        python3 -m pip install -r llvm-project/mlir/python/requirements.txt
+
+        cmake -GNinja -Bllvm-project/build
+        -DCMAKE_BUILD_TYPE=Release
+        -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+        -DCMAKE_C_COMPILER_LAUNCHER=${{ steps.config.outputs.launcher }}
+        -DCMAKE_CXX_COMPILER_LAUNCHER=${{ steps.config.outputs.launcher }}
+        -DCMAKE_INSTALL_PREFIX="${{ env.llvm_install_dir }}"
+        -DLLVM_BUILD_UTILS=ON
+        -DLLVM_ENABLE_ASSERTIONS=ON
+        -DLLVM_ENABLE_PROJECTS="mlir"
+        -DLLVM_ENABLE_RTTI=ON
+        -DLLVM_ENABLE_ZSTD=OFF
+        -DLLVM_INSTALL_UTILS=ON
+        -DLLVM_TARGETS_TO_BUILD="host"
+        -DLLVM_USE_LINKER=lld
+        -DMLIR_ENABLE_BINDINGS_PYTHON=ON
+        llvm-project/llvm
+
+        ninja -C llvm-project/build ${{ steps.config.outputs.parallel }}
+
+        ninja -C llvm-project/build check-mlir ${{ steps.config.outputs.parallel }}
+
+        ninja -C llvm-project/build install
+
+        tar czf "${{ env.llvm_install_dir }}.tar.gz" "${{ env.llvm_install_dir }}"
+
+    - name: Configure, Build, Test, and Install LLVM (macOS)
+      if: matrix.target-os == 'macos'
+      shell: bash
+      run: >
+        python3 -m pip install -r llvm-project/mlir/python/requirements.txt
+
+        cmake -GNinja -Bllvm-project/build
+        -DCMAKE_BUILD_TYPE=Release
+        -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+        -DCMAKE_C_COMPILER_LAUNCHER=${{ steps.config.outputs.launcher }}
+        -DCMAKE_CXX_COMPILER_LAUNCHER=${{ steps.config.outputs.launcher }}
+        -DCMAKE_INSTALL_PREFIX="${{ env.llvm_install_dir }}"
+        -DCMAKE_LINKER=lld
+        -DCMAKE_OSX_ARCHITECTURES=arm64
+        -DLLDB_INCLUDE_TESTS=OFF
+        -DLLVM_BUILD_UTILS=ON
+        -DLLVM_ENABLE_ASSERTIONS=ON
+        -DLLVM_ENABLE_PROJECTS="mlir"
+        -DLLVM_ENABLE_RTTI=ON
+        -DLLVM_ENABLE_ZSTD=OFF
+        -DLLVM_INSTALL_UTILS=ON
+        -DLLVM_TARGETS_TO_BUILD="AArch64"
+        -DLLVM_USE_HOST_TOOLS=ON
+        -DMACOSX_DEPLOYMENT_TARGET=12.0
+        -DMLIR_ENABLE_BINDINGS_PYTHON=ON
+        llvm-project/llvm
+
+        ninja -C llvm-project/build ${{ steps.config.outputs.parallel }}
+
+        ninja -C llvm-project/build install ${{ steps.config.outputs.parallel }}
+
+        tar czf "${{ env.llvm_install_dir }}.tar.gz" "${{ env.llvm_install_dir }}"
+
+    - name: Configure, Build, Test, and Install LLVM (Windows)
+      if: matrix.target-os == 'windows'
+      shell: bash
+      run: >
+        python3 -m pip install -r llvm-project/mlir/python/requirements.txt
+
+        cmake -GNinja -Bllvm-project/build
+        -DCMAKE_BUILD_TYPE=Release
+        -DCMAKE_C_COMPILER_LAUNCHER=${{ steps.config.outputs.launcher }}
+        -DCMAKE_CXX_COMPILER_LAUNCHER=${{ steps.config.outputs.launcher }}
+        -DCMAKE_INSTALL_PREFIX="${{ env.llvm_install_dir }}"
+        -DLLVM_BUILD_UTILS=ON
+        -DLLVM_ENABLE_ASSERTIONS=ON
+        -DLLVM_ENABLE_PROJECTS="mlir"
+        -DLLVM_ENABLE_RTTI=ON
+        -DLLVM_ENABLE_ZSTD=OFF
+        -DLLVM_INSTALL_UTILS=ON
+        -DLLVM_TARGETS_TO_BUILD="host"
+        -DLLVM_USE_LINKER=lld
+        -DMLIR_ENABLE_BINDINGS_PYTHON=ON
+        llvm-project/llvm
+
+        ninja -C llvm-project/build ${{ steps.config.outputs.parallel }}
+
+        ninja -C llvm-project/build check-mlir ${{ steps.config.outputs.parallel }}
+
+        ninja -C llvm-project/build install
+
+        tar czf "${{ env.llvm_install_dir }}.tar.gz" "${{ env.llvm_install_dir }}"
+
+    - name: Record Build Status
+      if: always()
+      id: output
+      shell: bash
+      run: echo "${{ matrix.target-os }}_${{ matrix.arch }}_status=${{ job.status }}" >> "$GITHUB_OUTPUT"
+
+    - name: Dump Sccache Statistics
+      shell: bash
+      run: sccache --show-stats
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: ${{ env.llvm_install_dir }}.tar.gz
+        path: ${{ env.llvm_install_dir }}.tar.gz
+
+    outputs:
+      ubuntu_x64_status: ${{ steps.output.outputs.ubuntu_x64_status }}
+      macos_arm64_status: ${{ steps.output.outputs.macos_arm64_status }}
+      windows_x64_status: ${{ steps.output.outputs.windows_x64_status }}
+
+
+  report-status:
+
+    if: always()
+
+    runs-on: ubuntu-22.04
+
+    needs: build
+
+    steps:
+
+    - name: Print Status
+      shell: bash
+      run: |
+        echo "ubuntu-x64-rel: ${{ needs.build.outputs.ubuntu_x64_status }}"
+        echo "macos-arm64-rel: ${{ needs.build.outputs.macos_arm64_status }}"
+        echo "windows-x64-rel: ${{ needs.build.outputs.windows_x64_status }}"
